@@ -1,5 +1,6 @@
 import re
 from typing import Tuple, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import allure
 from selenium.webdriver.common.keys import Keys
@@ -15,58 +16,102 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 
-
 Locator = Tuple[str, str]
 
 
 class BasePage:
     def __init__(self, driver, timeout: int = 15):
         self.driver = driver
+        self.timeout = timeout
         self.wait = WebDriverWait(driver, timeout, poll_frequency=0.3)
 
     # ---------------- URL ----------------
     @staticmethod
     def _normalize_url(url: str) -> str:
-        # убираем двойные слеши: https://site.ru//reset -> https://site.ru/reset
+        """
+        Убираем двойные слеши в PATH, но не ломаем https://
+
+        Пример:
+        https://site.ru//forgot-password -> https://site.ru/forgot-password
+        """
         if "://" not in url:
             return url
-        scheme, rest = url.split("://", 1)
-        rest = re.sub(r"/{2,}", "/", rest)
-        return f"{scheme}://{rest}"
+
+        parts = urlsplit(url)
+        # схлопываем // только в path, чтобы https:// не трогать
+        path = re.sub(r"/{2,}", "/", parts.path)
+        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
     @allure.step("Открыть страницу: {url}")
-    def open(self, url: str):
-        self.driver.get(self._normalize_url(url))
+    def open(self, url: str, timeout: int = 60):
+        """
+        Более устойчивый open():
+        - нормализуем url (без //)
+        - ставим page_load_timeout
+        - если Chrome подвис на загрузке — останавливаем window.stop() и продолжаем
+        """
+        url = self._normalize_url(url)
+
+        try:
+            self.driver.set_page_load_timeout(timeout)
+        except Exception:
+            pass
+
+        try:
+            self.driver.get(url)
+        except TimeoutException:
+            # Chrome завис на загрузке — останавливаем, дальше тесты всё равно ждут элементы через WebDriverWait
+            try:
+                self.driver.execute_script("window.stop();")
+            except Exception:
+                pass
+
         self.wait_for_page_ready()
 
-    def wait_for_page_ready(self):
-        self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    def wait_for_page_ready(self, timeout: Optional[int] = None):
+        t = timeout if timeout is not None else self.timeout
+        WebDriverWait(self.driver, t, poll_frequency=0.3).until(
+            lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
+        )
 
-    def wait_url_contains(self, text: str):
-        self.wait.until(EC.url_contains(text))
+    def wait_url_contains(self, text: str, timeout: Optional[int] = None):
+        t = timeout if timeout is not None else self.timeout
+        WebDriverWait(self.driver, t, poll_frequency=0.3).until(EC.url_contains(text))
 
     # ---------------- WAITERS (совместимость со скрытыми тестами) ----------------
-    def wait_for_presence(self, locator: Locator):
-        return self.wait.until(EC.presence_of_element_located(locator))
+    def wait_for_presence(self, locator: Locator, timeout: Optional[int] = None):
+        t = timeout if timeout is not None else self.timeout
+        return WebDriverWait(self.driver, t, poll_frequency=0.3).until(
+            EC.presence_of_element_located(locator)
+        )
 
-    def wait_for_visible(self, locator: Locator):
-        return self.wait.until(EC.visibility_of_element_located(locator))
+    def wait_for_visible(self, locator: Locator, timeout: Optional[int] = None):
+        t = timeout if timeout is not None else self.timeout
+        return WebDriverWait(self.driver, t, poll_frequency=0.3).until(
+            EC.visibility_of_element_located(locator)
+        )
 
-    def wait_for_clickable(self, locator: Locator):
-        return self.wait.until(EC.element_to_be_clickable(locator))
+    def wait_for_clickable(self, locator: Locator, timeout: Optional[int] = None):
+        t = timeout if timeout is not None else self.timeout
+        return WebDriverWait(self.driver, t, poll_frequency=0.3).until(
+            EC.element_to_be_clickable(locator)
+        )
 
-    def wait_for_invisible(self, locator: Locator):
-        return self.wait.until(EC.invisibility_of_element_located(locator))
+    def wait_for_invisible(self, locator: Locator, timeout: Optional[int] = None):
+        t = timeout if timeout is not None else self.timeout
+        return WebDriverWait(self.driver, t, poll_frequency=0.3).until(
+            EC.invisibility_of_element_located(locator)
+        )
 
     # ---------------- FINDERS ----------------
-    def find_presence(self, locator: Locator):
-        return self.wait_for_presence(locator)
+    def find_presence(self, locator: Locator, timeout: Optional[int] = None):
+        return self.wait_for_presence(locator, timeout=timeout)
 
-    def find_visible(self, locator: Locator):
-        return self.wait_for_visible(locator)
+    def find_visible(self, locator: Locator, timeout: Optional[int] = None):
+        return self.wait_for_visible(locator, timeout=timeout)
 
-    def find_clickable(self, locator: Locator):
-        return self.wait_for_clickable(locator)
+    def find_clickable(self, locator: Locator, timeout: Optional[int] = None):
+        return self.wait_for_clickable(locator, timeout=timeout)
 
     def is_present(self, locator: Locator, timeout: int = 2) -> bool:
         try:
@@ -79,25 +124,29 @@ class BasePage:
 
     # ---------------- HELPERS ----------------
     def scroll_to(self, element):
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center', inline:'center'});", element
-        )
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center', inline:'center'});", element
+            )
+        except Exception:
+            pass
 
     # ---------------- ACTIONS ----------------
     @allure.step("Клик по элементу: {locator}")
-    def click(self, locator: Locator, retries: int = 3):
+    def click(self, locator: Locator, retries: int = 3, timeout: Optional[int] = None):
         last_error: Optional[Exception] = None
+        t = timeout if timeout is not None else self.timeout
 
         for attempt in range(1, retries + 1):
             try:
-                el = self.find_clickable(locator)
+                el = self.find_clickable(locator, timeout=t)
                 self.scroll_to(el)
 
                 try:
                     el.click()
                 except (ElementClickInterceptedException, StaleElementReferenceException):
                     # fallback: JS click
-                    el = self.find_presence(locator)
+                    el = self.find_presence(locator, timeout=t)
                     self.scroll_to(el)
                     self.driver.execute_script("arguments[0].click();", el)
 
@@ -109,8 +158,8 @@ class BasePage:
         raise TimeoutException(f"Не удалось кликнуть по {locator}. Последняя ошибка: {last_error}")
 
     @allure.step("Ввод текста в элемент: {locator}")
-    def type(self, locator: Locator, text: str):
-        el = self.find_visible(locator)
+    def type(self, locator: Locator, text: str, timeout: Optional[int] = None):
+        el = self.find_visible(locator, timeout=timeout)
         self.scroll_to(el)
         el.click()
         el.send_keys(Keys.CONTROL + "a")
@@ -118,26 +167,26 @@ class BasePage:
         el.send_keys(text)
 
     # Совместимость с тестами/ревью: иногда ожидают методы send_keys() и text()
-    def send_keys(self, locator: Locator, text: str):
+    def send_keys(self, locator: Locator, text: str, timeout: Optional[int] = None):
         """Alias для type(): очистить поле и ввести текст."""
-        return self.type(locator, text)
+        return self.type(locator, text, timeout=timeout)
 
-    def text(self, locator: Locator) -> str:
+    def text(self, locator: Locator, timeout: Optional[int] = None) -> str:
         """Alias для get_text(): вернуть текст элемента."""
-        return self.get_text(locator)
+        return self.get_text(locator, timeout=timeout)
 
     def press_esc(self):
         ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
 
-    def get_text(self, locator: Locator) -> str:
-        return self.find_visible(locator).text
+    def get_text(self, locator: Locator, timeout: Optional[int] = None) -> str:
+        return self.find_visible(locator, timeout=timeout).text
 
-    def get_attribute(self, locator: Locator, name: str):
-        return self.find_presence(locator).get_attribute(name)
+    def get_attribute(self, locator: Locator, name: str, timeout: Optional[int] = None):
+        return self.find_presence(locator, timeout=timeout).get_attribute(name)
 
-    def wait_invisible(self, locator: Locator):
+    def wait_invisible(self, locator: Locator, timeout: Optional[int] = None):
         # оставляю твой метод, но пусть он зовёт совместимый
-        return self.wait_for_invisible(locator)
+        return self.wait_for_invisible(locator, timeout=timeout)
 
     # ---------------- MODAL ----------------
     @allure.step("Закрыть модалку (крестик/оверлей/ESC)")
@@ -156,14 +205,14 @@ class BasePage:
         # 1) Крестик
         try:
             if self.is_present(close_btn_locator, timeout=1):
-                self.click(close_btn_locator)
+                self.click(close_btn_locator, timeout=timeout)
         except Exception:
             pass
 
         # 2) Оверлей
         try:
             if self.is_present(modal_locator, timeout=1) and self.is_present(overlay_locator, timeout=1):
-                self.click(overlay_locator)
+                self.click(overlay_locator, timeout=timeout)
         except Exception:
             pass
 
@@ -179,9 +228,6 @@ class BasePage:
             EC.invisibility_of_element_located(modal_locator)
         )
 
-    # ---------------- DRAG & DROP (HTML5) ----------------
-    # ---------------- DRAG & DROP (HTML5) ----------------
-    # ---------------- DRAG & DROP (HTML5) ----------------
     # ---------------- DRAG & DROP (HTML5) ----------------
     def drag_and_drop_html5(self, source, target):
         """
@@ -222,15 +268,30 @@ class BasePage:
         """
         self.driver.execute_script(script, source_el, target_el)
 
-
     def is_disabled(self, element) -> bool:
-        """Проверяем disabled для кнопок (некоторые UI ставят disabled атрибутом)."""
+        """Проверяем disabled для кнопок (атрибут/aria/class/enable)."""
         try:
             if not element.is_enabled():
                 return True
         except Exception:
             pass
         try:
-            return (element.get_attribute('disabled') is not None)
+            if element.get_attribute("disabled") is not None:
+                return True
         except Exception:
-            return False
+            pass
+        try:
+            aria = (element.get_attribute("aria-disabled") or "").strip().lower()
+            if aria == "true":
+                return True
+        except Exception:
+            pass
+        try:
+            cls = (element.get_attribute("class") or "").lower()
+            if "disabled" in cls:
+                return True
+        except Exception:
+            pass
+        return False
+
+
