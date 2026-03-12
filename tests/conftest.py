@@ -29,7 +29,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--ui_url",
         action="store",
-        default=os.getenv("UI_URL", "https://stellarburgers.education-services.ru/")
+        default=os.getenv("UI_URL", "https://stellarburgers.education-services.ru")
     )
 
     parser.addoption(
